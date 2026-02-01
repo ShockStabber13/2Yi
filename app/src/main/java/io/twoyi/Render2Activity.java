@@ -19,6 +19,7 @@
 package io.twoyi;
 
 import android.app.Activity;
+import android.graphics.SurfaceTexture;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
@@ -27,8 +28,7 @@ import android.view.Display;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -55,7 +55,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private static final String TAG = "Render2Activity";
 
-    private SurfaceView mSurfaceView;
+    private TextureView mTextureView;
+    private Surface mSurface;
 
     private ViewGroup mRootView;
     private LoadingAnimationView mLoadingView;
@@ -65,34 +66,103 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
-    private final SurfaceHolder.Callback mSurfaceCallback = new SurfaceHolder.Callback() {
+    // For refresh-switch detection + re-init
+    private float mLastRefreshRate = -1f;
+    private float mXdpi;
+    private float mYdpi;
+    private String mLoaderPath;
+
+    private final Runnable mRefreshWatcher = new Runnable() {
         @Override
-        public void surfaceCreated(@NonNull SurfaceHolder holder) {
-            Surface surface = holder.getSurface();
-            WindowManager windowManager = getWindowManager();
-            Display defaultDisplay = windowManager.getDefaultDisplay();
-            DisplayMetrics displayMetrics = new DisplayMetrics();
-            defaultDisplay.getRealMetrics(displayMetrics);
+        public void run() {
+            try {
+                if (mSurface != null && mTextureView != null && mLoaderPath != null) {
+                    float rr = getWindowManager().getDefaultDisplay().getRefreshRate();
+                    if (mLastRefreshRate < 0) mLastRefreshRate = rr;
 
-            float xdpi = displayMetrics.xdpi;
-            float ydpi = displayMetrics.ydpi;
+                    // If refresh rate switched (e.g. 120 -> 60/90), re-init with new FPS.
+                    if (Math.abs(rr - mLastRefreshRate) > 1.0f) {
+                        mLastRefreshRate = rr;
+                        int fps = clampFps(Math.round(rr));
 
-            Renderer.init(surface, RomManager.getLoaderPath(getApplicationContext()), xdpi, ydpi, (int) getBestFps());
+                        Log.i(TAG, "Refresh switched -> re-init renderer. rr=" + rr + " fps=" + fps);
+
+                        try { Renderer.removeWindow(mSurface); } catch (Throwable ignored) {}
+                        Renderer.init(mSurface, mLoaderPath, mXdpi, mYdpi, fps);
+                        Renderer.resetWindow(mSurface, 0, 0, mTextureView.getWidth(), mTextureView.getHeight());
+                    }
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "RefreshWatcher error", t);
+            }
+
+            if (mRootView != null) {
+                mRootView.postDelayed(this, 1000);
+            }
+        }
+    };
+
+    private final TextureView.SurfaceTextureListener mTextureListener = new TextureView.SurfaceTextureListener() {
+        @Override
+        public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
+            // Make TextureView behave closer to a real output surface
+            try {
+                surfaceTexture.setDefaultBufferSize(width, height);
+            } catch (Throwable ignored) {}
+            try {
+                mTextureView.setOpaque(true);
+            } catch (Throwable ignored) {}
+
+            // Cleanup previous surface if any
+            if (mSurface != null) {
+                try { Renderer.removeWindow(mSurface); } catch (Throwable ignored) {}
+                try { mSurface.release(); } catch (Throwable ignored) {}
+                mSurface = null;
+            }
+
+            mSurface = new Surface(surfaceTexture);
+
+            // Cache loader path + dpi for possible re-init
+            mLoaderPath = RomManager.getLoaderPath(getApplicationContext());
+
+            DisplayMetrics dm = new DisplayMetrics();
+            getWindowManager().getDefaultDisplay().getRealMetrics(dm);
+            mXdpi = dm.xdpi;
+            mYdpi = dm.ydpi;
+
+            float rr = getWindowManager().getDefaultDisplay().getRefreshRate();
+            mLastRefreshRate = rr;
+            int fps = clampFps(Math.round(rr));
+
+            Log.i(TAG, "Surface available. refreshRate=" + rr + " -> fps=" + fps);
+
+            Renderer.init(mSurface, mLoaderPath, mXdpi, mYdpi, fps);
 
             Log.i(TAG, "surfaceCreated");
         }
 
         @Override
-        public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
-            Surface surface = holder.getSurface();
-            Renderer.resetWindow(surface, 0, 0, mSurfaceView.getWidth(), mSurfaceView.getHeight());
-            Log.i(TAG, "surfaceChanged: " + mSurfaceView.getWidth() + "x" + mSurfaceView.getHeight());
+        public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
+            if (mSurface == null) return;
+            Renderer.resetWindow(mSurface, 0, 0, mTextureView.getWidth(), mTextureView.getHeight());
+            Log.i(TAG, "surfaceChanged: " + mTextureView.getWidth() + "x" + mTextureView.getHeight());
         }
 
         @Override
-        public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
-            Renderer.removeWindow(holder.getSurface());
+        public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
+            if (mSurface != null) {
+                try { Renderer.removeWindow(mSurface); } catch (Throwable ignored) {}
+                try { mSurface.release(); } catch (Throwable ignored) {}
+                mSurface = null;
+            }
+
             Log.i(TAG, "surfaceDestroyed!");
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surfaceTexture) {
+            // no-op
         }
     };
 
@@ -102,24 +172,27 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         Log.i(TAG, "onCreate: " + savedInstanceState + " isStarted: " + started);
 
         if (started) {
-            // we have been started, but WTF we are onCreate again? just reboot ourself.
             finish();
             RomManager.reboot(this);
             return;
         }
 
-        // reset state
         TwoyiStatusManager.getInstance().reset();
-
         NavUtils.hideNavigation(getWindow());
 
         super.onCreate(savedInstanceState);
 
+        // Prevent screen-off policies from downshifting too aggressively
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        // Request a 120Hz display mode if available (no API 30 required)
+        requestHighRefreshDisplayMode();
+
         setContentView(R.layout.ac_render);
         mRootView = findViewById(R.id.root);
 
-        mSurfaceView = new SurfaceView(this);
-        mSurfaceView.getHolder().addCallback(mSurfaceCallback);
+        mTextureView = new TextureView(this);
+        mTextureView.setSurfaceTextureListener(mTextureListener);
 
         mLoadingLayout = findViewById(R.id.loadingLayout);
         mLoadingView = findViewById(R.id.loading);
@@ -131,8 +204,25 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         UITips.checkForAndroid12(this, this::bootSystem);
 
-        mSurfaceView.setOnTouchListener(this);
+        mTextureView.setOnTouchListener(this);
+    }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        requestHighRefreshDisplayMode();
+        if (mRootView != null) {
+            mRootView.removeCallbacks(mRefreshWatcher);
+            mRootView.postDelayed(mRefreshWatcher, 1000);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (mRootView != null) {
+            mRootView.removeCallbacks(mRefreshWatcher);
+        }
     }
 
     @Override
@@ -140,7 +230,6 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         super.onRestoreInstanceState(savedInstanceState);
         Log.i(TAG, "onRestoreInstanceState: " + savedInstanceState);
 
-        // we don't support state restore, just reboot.
         finish();
         RomManager.reboot(this);
     }
@@ -166,12 +255,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 RomManager.initRootfs(getApplicationContext());
 
                 runOnUiThread(() -> {
-                    mRootView.addView(mSurfaceView, 0);
+                    mRootView.addView(mTextureView, 0);
                     showBootingProcedure();
                 });
             }, "extract-rom").start();
         } else {
-            mRootView.addView(mSurfaceView, 0);
+            mRootView.addView(mTextureView, 0);
             showBootingProcedure();
         }
     }
@@ -198,30 +287,24 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     }
 
     private void showBootingProcedure() {
-        // mLoadingText.setText(R.string.booting_tips);
         mLoadingText.setVisibility(View.GONE);
         mBootLogView.setVisibility(View.VISIBLE);
         new Thread(() -> {
+            boolean success = false;
+            try {
+                success = TwoyiStatusManager.getInstance().waitBoot(15, TimeUnit.SECONDS);
+            } catch (Throwable ignored) {
+            }
 
-            if (true) {
-                boolean success = false;
-                try {
-                    success = TwoyiStatusManager.getInstance().waitBoot(15, TimeUnit.SECONDS);
-                } catch (Throwable ignored) {
-                }
+            if (!success) {
+                LogEvents.trackBootFailure(getApplicationContext());
+                runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
 
-                if (!success) {
-                    LogEvents.trackBootFailure(getApplicationContext());
+                SystemClock.sleep(3000);
 
-                    runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
-
-                    // waiting for track
-                    SystemClock.sleep(3000);
-
-                    finish();
-                    System.exit(0);
-                    return;
-                }
+                finish();
+                System.exit(0);
+                return;
             }
 
             runOnUiThread(() -> {
@@ -237,9 +320,9 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         if (hasFocus) {
             NavUtils.hideNavigation(getWindow());
+            requestHighRefreshDisplayMode();
         }
 
-        // Update global visibility.
         TwoyiStatusManager.getInstance().updateVisibility(hasFocus);
     }
 
@@ -260,23 +343,57 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     public void onBackPressed() {
-        // super.onBackPressed();
         Renderer.sendKeycode(KeyEvent.KEYCODE_HOME);
     }
 
-    private float getBestFps() {
-        WindowManager windowManager = getWindowManager();
-        Display defaultDisplay = windowManager.getDefaultDisplay();
-        Display.Mode[] supportedModes = defaultDisplay.getSupportedModes();
-        float fps = 45;
-        for (Display.Mode supportedMode : supportedModes) {
-            float refreshRate = supportedMode.getRefreshRate();
-            if (refreshRate > fps) {
-                // fps = refreshRate;
-            }
-        }
-
-        Log.w(TAG, "current fps: " + fps);
+    private static int clampFps(int fps) {
+        if (fps < 30) return 60;
+        if (fps > 240) return 240;
         return fps;
+    }
+
+    /**
+     * Requests a high refresh Display.Mode (prefers ~120Hz if available).
+     * This does NOT rely on API 30 methods, so it compiles on older compileSdk.
+     */
+    private void requestHighRefreshDisplayMode() {
+        try {
+            Display display = getWindowManager().getDefaultDisplay();
+            Display.Mode[] modes = display.getSupportedModes();
+
+            Display.Mode best = null;
+
+            // Prefer 120-ish first
+            for (Display.Mode m : modes) {
+                if (m.getRefreshRate() >= 119.5f) {
+                    if (best == null) best = m;
+                    else {
+                        int a0 = best.getPhysicalWidth() * best.getPhysicalHeight();
+                        int a1 = m.getPhysicalWidth() * m.getPhysicalHeight();
+                        if (a1 > a0) best = m;
+                    }
+                }
+            }
+
+            // If no 120Hz, pick the highest refresh available
+            if (best == null) {
+                for (Display.Mode m : modes) {
+                    if (best == null || m.getRefreshRate() > best.getRefreshRate()) {
+                        best = m;
+                    }
+                }
+            }
+
+            if (best != null) {
+                WindowManager.LayoutParams lp = getWindow().getAttributes();
+                lp.preferredDisplayModeId = best.getModeId();
+                getWindow().setAttributes(lp);
+                Log.i(TAG, "Requested display mode: " +
+                        best.getPhysicalWidth() + "x" + best.getPhysicalHeight() +
+                        " @" + best.getRefreshRate() + " (id=" + best.getModeId() + ")");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "requestHighRefreshDisplayMode failed", t);
+        }
     }
 }

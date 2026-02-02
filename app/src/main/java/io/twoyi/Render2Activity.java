@@ -25,6 +25,7 @@ import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
+import android.view.Choreographer;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -66,6 +67,46 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
+
+    // ---- Vsync-driven repaint pump ----
+    // We drive one repaint request per display vsync via Choreographer. This aligns the "present"
+    // requests to the system frame clock and reduces pacing wobble / bursty frame delivery.
+    private boolean mVsyncPumpEnabled = false;
+
+    private final Choreographer.FrameCallback mVsyncFrameCallback = new Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameTimeNanos) {
+            if (!mVsyncPumpEnabled) return;
+            try {
+                Renderer.repaint();
+            } catch (Throwable t) {
+                Log.w(TAG, "Renderer.repaint failed", t);
+                // Stop spamming if something goes wrong
+                mVsyncPumpEnabled = false;
+                return;
+            }
+            Choreographer.getInstance().postFrameCallback(this);
+        }
+    };
+
+    private void startVsyncPump() {
+        if (mVsyncPumpEnabled) return;
+        // Only start once the surface exists; repaint() needs a live RenderWindow.
+        if (mSurface == null) return;
+        mVsyncPumpEnabled = true;
+        Choreographer.getInstance().postFrameCallback(mVsyncFrameCallback);
+        Log.i(TAG, "Vsync pump started");
+    }
+
+    private void stopVsyncPump() {
+        if (!mVsyncPumpEnabled) return;
+        mVsyncPumpEnabled = false;
+        try {
+            Choreographer.getInstance().removeFrameCallback(mVsyncFrameCallback);
+        } catch (Throwable ignored) {}
+        Log.i(TAG, "Vsync pump stopped");
+    }
+
     // For refresh-switch detection + re-init
     private float mLastRefreshRate = -1f;
     private float mXdpi;
@@ -89,6 +130,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
                         try { Renderer.removeWindow(mSurface); } catch (Throwable ignored) {}
                         Renderer.init(mSurface, mLoaderPath, mXdpi, mYdpi, fps);
+                        startVsyncPump();
                         Renderer.resetWindow(mSurface, 0, 0, mTextureView.getWidth(), mTextureView.getHeight());
                     }
                 }
@@ -150,6 +192,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         @Override
         public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
+            stopVsyncPump();
             if (mSurface != null) {
                 try { Renderer.removeWindow(mSurface); } catch (Throwable ignored) {}
                 try { mSurface.release(); } catch (Throwable ignored) {}
@@ -214,12 +257,14 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         if (mRootView != null) {
             mRootView.removeCallbacks(mRefreshWatcher);
             mRootView.postDelayed(mRefreshWatcher, 1000);
+            startVsyncPump();
         }
     }
 
     @Override
     protected void onPause() {
         super.onPause();
+        stopVsyncPump();
         if (mRootView != null) {
             mRootView.removeCallbacks(mRefreshWatcher);
         }
@@ -321,6 +366,10 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         if (hasFocus) {
             NavUtils.hideNavigation(getWindow());
             requestHighRefreshDisplayMode();
+            startVsyncPump();
+        }
+        else {
+            stopVsyncPump();
         }
 
         TwoyiStatusManager.getInstance().updateVisibility(hasFocus);

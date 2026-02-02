@@ -40,4 +40,6 @@ public class Renderer {
     public static native void handleTouch(MotionEvent event);
 
     public static native void sendKeycode(int keycode);
+    public static native void repaint();
+
 }

@@ -135,6 +135,16 @@ pub fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
 }
 
 #[no_mangle]
+pub fn renderer_repaint(_env: JNIEnv, _clz: jclass) {
+    // Drive a repaint request into the OpenGL renderer. This is used by the Java-side
+    // Choreographer (vsync) loop to request one repaint per display vsync.
+    unsafe {
+        renderer_bindings::repaintOpenGLDisplay();
+    }
+}
+
+
+#[no_mangle]
 pub fn handle_touch(env: JNIEnv, _clz: jclass, event: jobject) {
     // TODO: cache the field id.
     let ptr = env.get_field(event, "mNativePtr", "J").unwrap();
@@ -208,6 +218,7 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         ),
         jni_method!(handleTouch, handle_touch, "(Landroid/view/MotionEvent;)V"),
         jni_method!(sendKeycode, send_key_code, "(I)V"),
+        jni_method!(repaint, renderer_repaint, "()V"),
     ];
 
     register_natives(&jvm, class_name, jni_methods.as_ref())
